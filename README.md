@@ -1,3 +1,9 @@
+---
+marp: true
+paginate: true
+theme: default
+---
+
 # ♻️ AI-Powered Disposal Sorter
 _A Smart Recycling System Using Image Classification_
 
