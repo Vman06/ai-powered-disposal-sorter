@@ -21,7 +21,7 @@ def encode_image_to_base64(image_path):
 def classify_item(image_path):
     img_b64 = encode_image_to_base64(image_path)
 
-    # 🧠 Strong prompt: prioritize compost for food items
+
     prompt = (
         "You are an expert in waste management and sustainability. "
         "Classify the item in the image as one of these categories: 'trash', 'recycling', or 'compost'.\n\n"
@@ -46,21 +46,21 @@ def classify_item(image_path):
     try:
         raw_response = response.json()["response"].strip()
     except Exception as e:
-        print("❌ Error:", e)
+        print("Error:", e)
         print("Full response:", response.text)
         return "Error"
 
-    print(f"\n🧩 Raw model response for {os.path.basename(image_path)}:")
+    print(f"\n Raw model response for {os.path.basename(image_path)}:")
     print(raw_response)
 
     # Extract classification
     result = raw_response.lower()
     if '"compost"' in result:
-        category = "🌿 Compost"
+        category = "Compost"
     elif '"recycling"' in result:
-        category = "♻️ Recycling"
+        category = "Recycling"
     else:
-        category = "🗑️ Trash"
+        category = "Trash"
 
     return category
 
@@ -69,7 +69,7 @@ def classify_item(image_path):
 # -------------------------------------
 if __name__ == "__main__":
     test_folder = "images"
-    print("\n🚀 Starting Waste Classifier using LLaVA...\n")
+    print("\n Starting Waste Classifier using LLaVA...\n")
 
     for filename in os.listdir(test_folder):
         if filename.lower().endswith((".jpg", ".jpeg", ".png")):
@@ -77,4 +77,4 @@ if __name__ == "__main__":
             category = classify_item(path)
             print(f"{filename:<25} → {category}")
 
-    print("\n✅ Classification complete!")
+    print("\n Classification complete!")
