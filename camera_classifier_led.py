@@ -8,10 +8,10 @@ import numpy as np
 # CONFIG
 # ----------------------------------
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
-MODEL = "llava:7b"          # fast model
-TIMEOUT = (5, 25)           # (connect_timeout, read_timeout)
-KEEP_ALIVE = "10m"          # keep model in RAM between runs
-STAIN_RATIO_THRESHOLD = 0.012  # tune: higher = stricter stain detection
+MODEL = "llava:7b"
+TIMEOUT = (5, 25)          # (connect_timeout, read_timeout)
+KEEP_ALIVE = "10m"
+STAIN_RATIO_THRESHOLD = 0.012  # tune higher = stricter stain detection
 
 # ----------------------------------
 # LEDS (Raspberry Pi) - BCM numbering
@@ -23,9 +23,9 @@ STAIN_RATIO_THRESHOLD = 0.012  # tune: higher = stricter stain detection
 from gpiozero import LED
 from time import sleep
 
-LED_TRASH   = LED(17)  # red (trash)
-LED_RECYCLE = LED(27)  # yellow (recycling)
-LED_COMPOST = LED(22)  # green (compost)
+LED_TRASH   = LED(17)  # red
+LED_RECYCLE = LED(27)  # yellow
+LED_COMPOST = LED(22)  # green
 
 def leds_off():
     LED_TRASH.off()
@@ -33,9 +33,6 @@ def leds_off():
     LED_COMPOST.off()
 
 def show_bin(bin_label: str, hold_seconds: float = 2.0):
-    """
-    bin_label: 'RECYCLING', 'TRASH', 'COMPOST' (or 'NONE')
-    """
     leds_off()
     b = (bin_label or "").strip().upper()
 
@@ -44,7 +41,6 @@ def show_bin(bin_label: str, hold_seconds: float = 2.0):
     elif b == "COMPOST":
         LED_COMPOST.on()
     else:
-        # TRASH / NONE / unknown => TRASH
         LED_TRASH.on()
 
     sleep(hold_seconds)
@@ -103,7 +99,6 @@ def cv_detect_paper_and_stains(image_path, debug=True):
 
     stain_on_paper = cv2.bitwise_and(stain_mask, paper_mask)
 
-    # Clean small specks
     kernel = np.ones((3, 3), np.uint8)
     stain_on_paper = cv2.morphologyEx(stain_on_paper, cv2.MORPH_OPEN, kernel, iterations=1)
 
@@ -179,11 +174,7 @@ Ignore people/hands/background. Focus only on discardable items.
         "images": [img_b64],
         "stream": False,
         "keep_alive": KEEP_ALIVE,
-        "options": {
-            "temperature": 0.0,
-            "top_p": 0.1,
-            "num_predict": 120
-        },
+        "options": {"temperature": 0.0, "top_p": 0.1, "num_predict": 120},
     }
 
     r = requests.post(OLLAMA_API_URL, json=payload, timeout=TIMEOUT)
@@ -214,11 +205,12 @@ def parse_flags(raw: str):
     return flags
 
 # ----------------------------------
-# YOUR STRICT DECISION RULE
-# - ONLY pure recycling => RECYCLING
-# - ANY mix (recycling + compost/stains) => TRASH
-# - ANY trash signals => TRASH
-# - otherwise => TRASH
+# DECISION RULE (now includes COMPOST)
+# - If container holds other items => TRASH
+# - If MIX of categories => TRASH
+# - Pure compost => COMPOST
+# - Pure recycling => RECYCLING
+# - Otherwise => TRASH
 # ----------------------------------
 def decide_bin(flags, paper_stained=False):
     if flags.get("CONTAINS_OTHER_ITEM") == "YES":
@@ -231,10 +223,38 @@ def decide_bin(flags, paper_stained=False):
         "PLASTIC_BOTTLE_OR_TUB_PRESENT"
     ])
 
-    has_compost_signal = (flags.get("FOOD_PRESENT") == "YES") or paper_stained
-    has_trash_signal = (flags.get("WRAPPER_OR_FILM_PRESENT") == "YES") or (flags.get("SMALL_RIGID_PLASTIC_PRESENT") == "YES")
+    has_compost = (flags.get("FOOD_PRESENT") == "YES")
 
-    if has_recycling and (not has_compost_signal) and (not has_trash_signal):
+    # stain counts as "compost contamination" on paper => makes it mixed
+    compost_contamination = paper_stained
+
+    has_trash = (flags.get("WRAPPER_OR_FILM_PRESENT") == "YES") or \
+                (flags.get("SMALL_RIGID_PLASTIC_PRESENT") == "YES")
+
+    # how many categories exist?
+    # recycling category exists if recyclable item present
+    # compost category exists if food present
+    # trash category exists if trash signals OR stain contamination (only matters if recycling also present)
+    categories_present = 0
+    if has_recycling: categories_present += 1
+    if has_compost: categories_present += 1
+    if has_trash: categories_present += 1
+
+    # Special: stain-only should NOT make pure food become trash; it only matters when paper exists.
+    # But if paper is present AND stained, that's mixed => TRASH.
+    if has_recycling and compost_contamination:
+        return "TRASH"
+
+    # Mixed categories => TRASH
+    if categories_present >= 2:
+        return "TRASH"
+
+    # Single category decisions
+    if has_trash:
+        return "TRASH"
+    if has_compost and (not has_recycling) and (not has_trash):
+        return "COMPOST"
+    if has_recycling and (not has_compost) and (not has_trash):
         return "RECYCLING"
 
     return "TRASH"
