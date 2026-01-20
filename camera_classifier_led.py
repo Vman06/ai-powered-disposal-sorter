@@ -4,22 +4,27 @@ import base64
 import requests
 import numpy as np
 
-# ----------------------------------
+# ============================================================
 # CONFIG
-# ----------------------------------
+# ============================================================
+# If Ollama is running on another device, change this to:
+# OLLAMA_API_URL = "http://<YOUR_MAC_IP>:11434/api/generate"
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
-MODEL = "llava:7b"
-TIMEOUT = (5, 25)          # (connect_timeout, read_timeout)
-KEEP_ALIVE = "10m"
-STAIN_RATIO_THRESHOLD = 0.012  # tune higher = stricter stain detection
 
-# ----------------------------------
+MODEL = "llava:7b"                 # faster than 13b
+TIMEOUT = (5, 25)                  # (connect_timeout, read_timeout)
+KEEP_ALIVE = "10m"                 # keep model in RAM between runs
+
+# CV stain detector threshold (paper/cardboard only)
+STAIN_RATIO_THRESHOLD = 0.012      # tune up/down
+
+# ============================================================
 # LEDS (Raspberry Pi) - BCM numbering
 # Your wiring:
 # pin 11 -> GPIO17 -> RED (TRASH)
 # pin 13 -> GPIO27 -> YELLOW (RECYCLING)
 # pin 15 -> GPIO22 -> GREEN (COMPOST)
-# ----------------------------------
+# ============================================================
 from gpiozero import LED
 from time import sleep
 
@@ -32,7 +37,10 @@ def leds_off():
     LED_RECYCLE.off()
     LED_COMPOST.off()
 
-def show_bin(bin_label: str, hold_seconds: float = 2.0):
+def show_bin(bin_label: str, hold_seconds: float = 3.0):
+    """
+    bin_label: 'RECYCLING', 'TRASH', 'COMPOST' (or 'NONE')
+    """
     leds_off()
     b = (bin_label or "").strip().upper()
 
@@ -41,14 +49,15 @@ def show_bin(bin_label: str, hold_seconds: float = 2.0):
     elif b == "COMPOST":
         LED_COMPOST.on()
     else:
+        # TRASH / NONE / unknown => TRASH
         LED_TRASH.on()
 
     sleep(hold_seconds)
     leds_off()
 
-# ----------------------------------
-# CAPTURE IMAGE FROM CAMERA
-# ----------------------------------
+# ============================================================
+# CAPTURE IMAGE (USB CAM / OPENCV)
+# ============================================================
 def capture_image():
     camera = cv2.VideoCapture(0)
     if not camera.isOpened():
@@ -71,15 +80,37 @@ def capture_image():
     print(f"✅ Image saved as {filename}")
     return filename
 
-# ----------------------------------
+
+# ============================================================
+# OPTIONAL: WARMUP (reduces first-call lag)
+# ============================================================
+def warmup():
+    try:
+        payload = {
+            "model": MODEL,
+            "prompt": "Reply with OK.",
+            "stream": False,
+            "keep_alive": KEEP_ALIVE,
+            "options": {"temperature": 0.0, "num_predict": 4},
+        }
+        requests.post(OLLAMA_API_URL, json=payload, timeout=TIMEOUT).raise_for_status()
+    except Exception:
+        pass
+
+
+# ============================================================
 # FAST CV STAIN DETECTOR (paper/cardboard)
-# ----------------------------------
+# ============================================================
 def cv_detect_paper_and_stains(image_path, debug=True):
+    """
+    Detect paper-like area and obvious orange/brown/red-ish stains on it.
+    Returns: (paper_like_present, stained, info_dict)
+    """
     img = cv2.imread(image_path)
     if img is None:
         return False, False, {"reason": "cv2.imread failed"}
 
-    # Downscale for speed + stability
+    # Downscale for speed
     h, w = img.shape[:2]
     scale = 700 / max(h, w)
     if scale < 1.0:
@@ -87,18 +118,19 @@ def cv_detect_paper_and_stains(image_path, debug=True):
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # Paper-like pixels: low saturation + high brightness
+    # Paper-like: low saturation + bright
     paper_mask = cv2.inRange(hsv, (0, 0, 120), (179, 70, 255))
     paper_pixels = int(np.count_nonzero(paper_mask))
     paper_like_present = paper_pixels > 2500
 
-    # Stain-like pixels: orange/brown/red-ish (sauce/grease)
+    # Stain-like: orange/brown/red-ish
     stain_mask1 = cv2.inRange(hsv, (0, 60, 50), (25, 255, 255))
     stain_mask2 = cv2.inRange(hsv, (160, 60, 50), (179, 255, 255))
     stain_mask = cv2.bitwise_or(stain_mask1, stain_mask2)
 
     stain_on_paper = cv2.bitwise_and(stain_mask, paper_mask)
 
+    # remove tiny specks
     kernel = np.ones((3, 3), np.uint8)
     stain_on_paper = cv2.morphologyEx(stain_on_paper, cv2.MORPH_OPEN, kernel, iterations=1)
 
@@ -111,33 +143,51 @@ def cv_detect_paper_and_stains(image_path, debug=True):
         "paper_pixels": paper_pixels,
         "stain_pixels": stain_pixels,
         "stain_ratio": ratio,
-        "threshold": STAIN_RATIO_THRESHOLD
+        "threshold": STAIN_RATIO_THRESHOLD,
     }
+
     if debug:
         print(f"🧪 CV paper_pixels={paper_pixels}, stain_pixels={stain_pixels}, "
               f"ratio={ratio:.4f} (thresh={STAIN_RATIO_THRESHOLD})")
+
     return paper_like_present, stained, info
 
-# ----------------------------------
-# OPTIONAL: WARMUP (reduces first-call lag)
-# ----------------------------------
-def warmup():
-    try:
-        payload = {
-            "model": MODEL,
-            "prompt": "Reply with OK.",
-            "stream": False,
-            "keep_alive": KEEP_ALIVE,
-            "options": {"temperature": 0.0, "num_predict": 4}
-        }
-        requests.post(OLLAMA_API_URL, json=payload, timeout=TIMEOUT).raise_for_status()
-    except Exception:
-        pass
 
-# ----------------------------------
-# LLAVA FLAGS (materials + contains)
-# ----------------------------------
-def call_llava(image_path):
+# ============================================================
+# STAGE 1: FOOD-ONLY CHECK
+# ============================================================
+def call_llava_food_only(image_path):
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    prompt = """
+Answer with EXACTLY ONE WORD: YES or NO.
+
+Question: Is there edible food (fruit/vegetables/leftovers) as the main object?
+
+Rules:
+- If you clearly see an edible item like an orange/apple/banana -> YES
+- Do NOT guess. If unsure -> NO
+""".strip()
+
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+        "keep_alive": KEEP_ALIVE,
+        "options": {"temperature": 0.0, "top_p": 0.1, "num_predict": 5},
+    }
+
+    r = requests.post(OLLAMA_API_URL, json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("response", "").strip().upper()
+
+
+# ============================================================
+# STAGE 2: MATERIAL/CONTAINS FLAGS
+# ============================================================
+def call_llava_flags(image_path):
     with open(image_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
@@ -181,6 +231,7 @@ Ignore people/hands/background. Focus only on discardable items.
     r.raise_for_status()
     return r.json().get("response", "").strip()
 
+
 def parse_flags(raw: str):
     flags = {}
     for line in raw.splitlines():
@@ -204,15 +255,12 @@ def parse_flags(raw: str):
         flags.setdefault(k, "NO")
     return flags
 
-# ----------------------------------
-# DECISION RULE (now includes COMPOST)
-# - If container holds other items => TRASH
-# - If MIX of categories => TRASH
-# - Pure compost => COMPOST
-# - Pure recycling => RECYCLING
-# - Otherwise => TRASH
-# ----------------------------------
+
+# ============================================================
+# DECISION LOGIC (3-bin)
+# ============================================================
 def decide_bin(flags, paper_stained=False):
+    # packed container rule
     if flags.get("CONTAINS_OTHER_ITEM") == "YES":
         return "TRASH"
 
@@ -220,44 +268,25 @@ def decide_bin(flags, paper_stained=False):
         "GLASS_PRESENT",
         "METAL_PRESENT",
         "PAPER_PRESENT",
-        "PLASTIC_BOTTLE_OR_TUB_PRESENT"
+        "PLASTIC_BOTTLE_OR_TUB_PRESENT",
     ])
 
-    has_compost = (flags.get("FOOD_PRESENT") == "YES")
+    has_trash_signal = (flags.get("WRAPPER_OR_FILM_PRESENT") == "YES") or (flags.get("SMALL_RIGID_PLASTIC_PRESENT") == "YES")
 
-    # stain counts as "compost contamination" on paper => makes it mixed
-    compost_contamination = paper_stained
+    has_compost_signal = (flags.get("FOOD_PRESENT") == "YES") or paper_stained
 
-    has_trash = (flags.get("WRAPPER_OR_FILM_PRESENT") == "YES") or \
-                (flags.get("SMALL_RIGID_PLASTIC_PRESENT") == "YES")
+    categories_present = sum([has_recycling, has_trash_signal, has_compost_signal])
 
-    # how many categories exist?
-    # recycling category exists if recyclable item present
-    # compost category exists if food present
-    # trash category exists if trash signals OR stain contamination (only matters if recycling also present)
-    categories_present = 0
-    if has_recycling: categories_present += 1
-    if has_compost: categories_present += 1
-    if has_trash: categories_present += 1
-
-    # Special: stain-only should NOT make pure food become trash; it only matters when paper exists.
-    # But if paper is present AND stained, that's mixed => TRASH.
-    if has_recycling and compost_contamination:
-        return "TRASH"
-
-    # Mixed categories => TRASH
+    if categories_present == 0:
+        return "NONE"
     if categories_present >= 2:
         return "TRASH"
-
-    # Single category decisions
-    if has_trash:
+    if has_trash_signal:
         return "TRASH"
-    if has_compost and (not has_recycling) and (not has_trash):
+    if has_compost_signal:
         return "COMPOST"
-    if has_recycling and (not has_compost) and (not has_trash):
-        return "RECYCLING"
+    return "RECYCLING"
 
-    return "TRASH"
 
 def pretty(label):
     return {
@@ -267,34 +296,54 @@ def pretty(label):
         "NONE": "🗑️ Trash",
     }.get(label, "🗑️ Trash")
 
-# ----------------------------------
+
+# ============================================================
 # MAIN
-# ----------------------------------
+# ============================================================
 if __name__ == "__main__":
     print("🚀 Starting camera capture and classification...")
     leds_off()
     warmup()
 
     image_path = capture_image()
-    if image_path:
-        paper_like, paper_stained, _info = cv_detect_paper_and_stains(image_path, debug=True)
+    if not image_path:
+        raise SystemExit(0)
 
-        try:
-            raw = call_llava(image_path)
-            print(f"🧩 Raw response:\n{raw}")
-            flags = parse_flags(raw)
-        except Exception as e:
-            print("❌ LLaVA error/timeout:", e)
-            final = "TRASH"
+    # ---- Stage 1: Food-only
+    try:
+        food_yesno = call_llava_food_only(image_path)
+        print(f"🥕 FOOD_ONLY={food_yesno}")
+        if food_yesno == "YES":
+            final = "COMPOST"
             print(f"\n🔎 Classification result → {pretty(final)}")
             show_bin(final, hold_seconds=3.0)
             raise SystemExit(0)
+    except Exception as e:
+        print("❌ Food-only check failed:", e)
+        # continue rather than dying
 
-        use_stain = paper_stained if (paper_like or flags.get("PAPER_PRESENT") == "YES") else False
-        final = decide_bin(flags, paper_stained=use_stain)
+    # ---- CV stain detection
+    paper_like, paper_stained, _info = cv_detect_paper_and_stains(image_path, debug=True)
 
-        print(f"\n🧪 CV_PAPER_STAINED={use_stain}")
-        print(f"🔎 Classification result → {pretty(final)}")
-
-        # ✅ Turn on the LED for the result automatically
+    # ---- Stage 2: General flags
+    try:
+        raw = call_llava_flags(image_path)
+        print(f"🧩 Raw response:\n{raw}")
+        flags = parse_flags(raw)
+    except Exception as e:
+        print("❌ LLaVA error/timeout:", e)
+        final = "TRASH"
+        print(f"\n🔎 Classification result → {pretty(final)}")
         show_bin(final, hold_seconds=3.0)
+        raise SystemExit(0)
+
+    # Only apply stain logic if paper-like OR model says paper present
+    use_stain = paper_stained if (paper_like or flags.get("PAPER_PRESENT") == "YES") else False
+
+    final = decide_bin(flags, paper_stained=use_stain)
+
+    print(f"\n🧪 CV_PAPER_STAINED={use_stain}")
+    print(f"🔎 Classification result → {pretty(final)}")
+
+    # ✅ LED output
+    show_bin(final, hold_seconds=3.0)
