@@ -7,7 +7,7 @@ import numpy as np
 # ----------------------------------
 # CONFIG
 # ----------------------------------
-OLLAMA_API_URL = "http://192.168.4.130:11434/api/generate"
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
 MODEL = "llava:7b"          # fast model (you said it exists)
 TIMEOUT = (5, 25)           # (connect_timeout, read_timeout)
 KEEP_ALIVE = "10m"          # keep model in RAM between runs
@@ -16,25 +16,11 @@ STAIN_RATIO_THRESHOLD = 0.012  # tune: higher = stricter stain detection
 # ----------------------------------
 # CAPTURE IMAGE FROM MAC CAMERA
 # ----------------------------------
-from picamera2 import Picamera2
-import time
-
 def capture_image():
-    print("📷 Starting Pi Camera... capturing in 1 second.")
-    picam2 = Picamera2()
-    config = picam2.create_still_configuration(main={"size": (1280, 720)})
-    picam2.configure(config)
-
-    picam2.start()
-    time.sleep(1)
-
-    filename = "capture.jpg"
-    picam2.capture_file(filename)
-    picam2.stop()
-
-    print(f"✅ Image saved as {filename}")
-    return filename
-
+    camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        print("❌ Could not access camera.")
+        return None
 
     print("📷 Starting camera... capturing in 1 second.")
     time.sleep(1)
